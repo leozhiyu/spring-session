@@ -19,7 +19,9 @@ package org.springframework.session.web.http;
 import java.io.IOException;
 import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 import javax.servlet.FilterChain;
 import javax.servlet.RequestDispatcher;
@@ -39,6 +41,7 @@ import org.springframework.core.annotation.Order;
 import org.springframework.session.ExpiringSession;
 import org.springframework.session.Session;
 import org.springframework.session.SessionRepository;
+import org.springframework.util.StringUtils;
 
 /**
  * Switches the {@link javax.servlet.http.HttpSession} implementation to be backed by a
@@ -110,6 +113,24 @@ public class SessionRepositoryFilter<S extends ExpiringSession>
 	private ServletContext servletContext;
 
 	private MultiHttpSessionStrategy httpSessionStrategy = new CookieHttpSessionStrategy();
+
+	private Set<String> skipCommitSessionApis = new HashSet<String>();
+
+	public void setSkipCommitSessionApis(String skipUpdateSessionApis) {
+		if (StringUtils.isEmpty(skipUpdateSessionApis)) {
+			return;
+		}
+
+		for (String api: skipUpdateSessionApis.split(",")) {
+            this.skipCommitSessionApis.add(api.trim());
+        }
+	}
+
+	private int sessionTimeout = -1;
+
+	public void setSessionTimeout(int sessionTimeout) {
+	    this.sessionTimeout = sessionTimeout;
+    }
 
 	/**
 	 * Creates a new instance.
@@ -237,6 +258,10 @@ public class SessionRepositoryFilter<S extends ExpiringSession>
 		 * persist the Session.
 		 */
 		private void commitSession() {
+		    if (skipCommitSessionApis.contains(super.getRequestURI())) {
+                return;
+            }
+
 			HttpSessionWrapper wrappedSession = getCurrentSession();
 			if (wrappedSession == null) {
 				if (isInvalidateClientSession()) {
@@ -375,6 +400,11 @@ public class SessionRepositoryFilter<S extends ExpiringSession>
 								"For debugging purposes only (not an error)"));
 			}
 			S session = SessionRepositoryFilter.this.sessionRepository.createSession();
+            if (sessionTimeout > 60) {
+                session.setMaxInactiveIntervalInSeconds(sessionTimeout);
+            } else if (sessionTimeout > 0) {
+                session.setMaxInactiveIntervalInSeconds(60);
+            }
 			session.setLastAccessedTime(System.currentTimeMillis());
 			currentSession = new HttpSessionWrapper(session, getServletContext());
 			setCurrentSession(currentSession);
