@@ -16,19 +16,6 @@
 
 package org.springframework.session.jdbc;
 
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.util.ArrayList;
-import java.util.Base64;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-
-import javax.sql.DataSource;
-
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.springframework.core.convert.ConversionService;
@@ -62,6 +49,26 @@ import org.springframework.transaction.support.TransactionOperations;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.util.Assert;
 import org.springframework.util.StringUtils;
+
+import javax.sql.DataSource;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * A {@link org.springframework.session.SessionRepository} implementation that uses
@@ -227,6 +234,10 @@ public class JdbcOperationsSessionRepository implements
 
 	private LobHandler lobHandler = new DefaultLobHandler();
 
+	private BlockingQueue<JdbcSession> sessionBlockingQueue = new LinkedBlockingQueue(4096);
+
+	private ScheduledExecutorService sessionUpdateExecutor = Executors.newScheduledThreadPool(1);
+
 	/**
 	 * Create a new {@link JdbcOperationsSessionRepository} instance which uses the
 	 * default {@link JdbcOperations} to manage sessions.
@@ -251,6 +262,82 @@ public class JdbcOperationsSessionRepository implements
 		this.transactionOperations = createTransactionTemplate(transactionManager);
 		this.conversionService = createDefaultConversionService();
 		prepareQueries();
+		sessionUpdateExecutor.scheduleAtFixedRate(this::updateSession, 0, 1, TimeUnit.SECONDS);
+	}
+
+	public void updateSession() {
+		CopyOnWriteArrayList<JdbcSession> sessions = new CopyOnWriteArrayList<>();
+		sessionBlockingQueue.drainTo(sessions);
+
+		List<JdbcSession> distinctSessions = new ArrayList<>(sessions.stream()
+				.collect(Collectors.toMap(JdbcSession::getId, Function.identity(), (k, v) -> v))
+				.values());
+
+		distinctSessions.forEach((session) -> {
+			this.transactionOperations.execute(new TransactionCallbackWithoutResult() {
+				protected void doInTransactionWithoutResult(TransactionStatus status) {
+					if (session.isChanged()) {
+						JdbcOperationsSessionRepository.this.jdbcOperations.update(
+								JdbcOperationsSessionRepository.this.updateSessionQuery,
+								new PreparedStatementSetter() {
+
+									public void setValues(PreparedStatement ps)
+											throws SQLException {
+										ps.setLong(1, session.getLastAccessedTime());
+										ps.setInt(2, session.getMaxInactiveIntervalInSeconds());
+										ps.setString(3, session.getPrincipalName());
+										ps.setString(4, getEncodeSessionId(session.getId()));
+									}
+
+								});
+					}
+					Map<String, Object> delta = session.getDelta();
+					if (!delta.isEmpty()) {
+						for (final Map.Entry<String, Object> entry : delta.entrySet()) {
+							if (entry.getValue() == null) {
+								JdbcOperationsSessionRepository.this.jdbcOperations.update(
+										JdbcOperationsSessionRepository.this.deleteSessionAttributeQuery,
+										new PreparedStatementSetter() {
+
+											public void setValues(PreparedStatement ps) throws SQLException {
+												ps.setString(1, getEncodeSessionId(session.getId()));
+												ps.setString(2, entry.getKey());
+											}
+
+										});
+							} else {
+								int updatedCount = JdbcOperationsSessionRepository.this.jdbcOperations.update(
+										JdbcOperationsSessionRepository.this.updateSessionAttributeQuery,
+										new PreparedStatementSetter() {
+
+											public void setValues(PreparedStatement ps) throws SQLException {
+												serialize(ps, 1, entry.getValue());
+												ps.setString(2, getEncodeSessionId(session.getId()));
+												ps.setString(3, entry.getKey());
+											}
+
+										});
+								if (updatedCount == 0) {
+									JdbcOperationsSessionRepository.this.jdbcOperations.update(
+											JdbcOperationsSessionRepository.this.createSessionAttributeQuery,
+											new PreparedStatementSetter() {
+
+												public void setValues(PreparedStatement ps) throws SQLException {
+													ps.setString(1, entry.getKey());
+													serialize(ps, 2, entry.getValue());
+													ps.setString(3, getEncodeSessionId(session.getId()));
+												}
+
+											});
+								}
+							}
+						}
+					}
+				}
+
+			});
+			session.clearChangeFlags();
+		});
 	}
 
 	/**
@@ -435,76 +522,16 @@ public class JdbcOperationsSessionRepository implements
 					}
 
 				});
+				session.clearChangeFlags();
 			} else {
-				this.transactionOperations.execute(new TransactionCallbackWithoutResult() {
-
-					protected void doInTransactionWithoutResult(TransactionStatus status) {
-						if (session.isChanged()) {
-							JdbcOperationsSessionRepository.this.jdbcOperations.update(
-									JdbcOperationsSessionRepository.this.updateSessionQuery,
-									new PreparedStatementSetter() {
-
-										public void setValues(PreparedStatement ps)
-												throws SQLException {
-											ps.setLong(1, session.getLastAccessedTime());
-											ps.setInt(2, session.getMaxInactiveIntervalInSeconds());
-											ps.setString(3, session.getPrincipalName());
-											ps.setString(4, getEncodeSessionId(session.getId()));
-										}
-
-									});
-						}
-						Map<String, Object> delta = session.getDelta();
-						if (!delta.isEmpty()) {
-							for (final Map.Entry<String, Object> entry : delta.entrySet()) {
-								if (entry.getValue() == null) {
-									JdbcOperationsSessionRepository.this.jdbcOperations.update(
-											JdbcOperationsSessionRepository.this.deleteSessionAttributeQuery,
-											new PreparedStatementSetter() {
-
-												public void setValues(PreparedStatement ps) throws SQLException {
-													ps.setString(1, getEncodeSessionId(session.getId()));
-													ps.setString(2, entry.getKey());
-												}
-
-											});
-								} else {
-									int updatedCount = JdbcOperationsSessionRepository.this.jdbcOperations.update(
-											JdbcOperationsSessionRepository.this.updateSessionAttributeQuery,
-											new PreparedStatementSetter() {
-
-												public void setValues(PreparedStatement ps) throws SQLException {
-													serialize(ps, 1, entry.getValue());
-													ps.setString(2, getEncodeSessionId(session.getId()));
-													ps.setString(3, entry.getKey());
-												}
-
-											});
-									if (updatedCount == 0) {
-										JdbcOperationsSessionRepository.this.jdbcOperations.update(
-												JdbcOperationsSessionRepository.this.createSessionAttributeQuery,
-												new PreparedStatementSetter() {
-
-													public void setValues(PreparedStatement ps) throws SQLException {
-														ps.setString(1, entry.getKey());
-														serialize(ps, 2, entry.getValue());
-														ps.setString(3, getEncodeSessionId(session.getId()));
-													}
-
-												});
-									}
-								}
-							}
-						}
-					}
-
-				});
+				sessionBlockingQueue.put(session);
 			}
-			session.clearChangeFlags();
 		}
 		catch(DataIntegrityViolationException e){
 			logger.error(e);
 			throw new DataIntegrityViolationException("The data exceeds the limit of length for column ‘session_id’. Please adjust its maximum value and try again.");
+		} catch (InterruptedException e) {
+			logger.error(e);
 		}
 	}
 
